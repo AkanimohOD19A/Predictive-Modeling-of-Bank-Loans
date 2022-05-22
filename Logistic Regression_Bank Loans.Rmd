@@ -1,0 +1,406 @@
+---
+title: "Logistic Regression of Bank Loans"
+author: "AfroLogicInsect_MLReview"
+date: "4/29/2022"
+output: html_document
+---
+
+## Load Library
+```{r output = FALSE, echo = FALSE, message=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(caret)
+library(data.table)
+library(ROSE)
+library(caTools)
+library(pROC)
+library(PRROC)
+library(mvtnorm)
+```
+
+
+## Load Dataset
+```{r}
+loan_Df <- read.csv("C:/Users/PC/Documents/R_4DS/bank_loan.csv", stringsAsFactors = FALSE)
+```
+
+
+## Exploratory Dataset
+```{r}
+##drop cases where there is no Loan Amount
+df <- loan_Df %>% 
+  filter_at(vars(LoanAmount, Loan_Amount_Term), all_vars(!is.na(.))) %>% 
+  mutate(Loan_Status = if_else(Loan_Status == "Y", 1,0)) %>% 
+  mutate(Gender = if_else(Gender == "Male", 1,0)) %>%
+  mutate(Married = if_else(Married == "Yes",1,0)) %>%
+  mutate(Self_Employed = if_else(Self_Employed == "Yes",1,0)) %>%
+  mutate(Education = if_else(Education == "Graduate", 1,0)) %>%
+  mutate(Property_Area = if_else(Property_Area == "Rural", 0, if_else(Property_Area == "Semiurban", 1, 2))) %>% 
+  select(-c(Loan_ID))
+
+df$Credit_History[is.na(df$Credit_History)] <- 0
+```
+Dropped `r dim(loan_Df)[1] - dim(df)[1]` rows of data that provided no sense to being empty, if the **Credit History** is NULL then it is better as `0` and dropped the LoanID column for now.
+
+```{r}
+## Visualizing
+### Checking for Bias in the Loan Status: Dependent Variable
+
+library(scales)
+plotdata <- count(loan_Df, Loan_Status) %>% 
+  mutate(pct = n/sum(n),
+         pctlabel = paste0(round(pct*100), "%"))
+
+
+plotdata
+
+plotdata %>% 
+  ggplot(aes(x = reorder(Loan_Status, -pct),
+             y = pct)) +
+  geom_bar(stat = "identity", fill = "indianred3", color = "black") + 
+  geom_text(aes(label = pctlabel),
+            vjust=-0.25) +
+  scale_y_continuous(labels = percent) +
+  labs(x = "Status", y = "Frequency", title = "Loan Status: Check for Bias")
+
+```
+
+
+```{r}
+# ggplot(loan2 , aes(x = grade , y = int_rate , fill = grade)) + 
+#         geom_boxplot() + 
+#         theme_igray() + 
+#         labs(y = 'Interest Rate' , x = 'Grade')
+
+# ggplot(loan2[sample(244179 , 10000) , ] , aes(x = annual_inc , y = loan_amnt , color = int_rate)) +
+#         geom_point(alpha = 0.5 , size = 1.5) + 
+#         geom_smooth(se = F , color = 'darkred' , method = 'loess') +
+#         xlim(c(0 , 300000)) + 
+#         labs(x = 'Annual Income' , y = 'Loan Ammount' , color = 'Interest Rate')
+```
+
+
+
+
+Most of the transactions were Approved for Loan (`r plotdata$pctlabel[plotdata$Loan_Status == "Y"]`) of the time, while Declined Loans occurs (`plotdata$pctlabel[plotdata$Loan_Status == "N"]`) of the time in the dataframe. This presents us with an IMBALANCE.
+
+## Modeling
+```{r}
+##Convert Dependent Variable to Numeric
+##Train-Test Split
+
+n_train <- round(0.8 * nrow(df))
+train_indices <- sample(1:nrow(df), n_train)
+df_train <- df[train_indices, ]
+df_test <- df[-train_indices, ] 
+```
+
+
+```{r}
+## Feature Scaling
+training_set <- df_train 
+test_set <- df_test  
+
+###---|| NB: We do not scales the Response Variable;Data has to be numeric.
+training_set[-12] = scale(training_set[-12])
+test_set[-12] = scale(test_set[-12])
+```
+
+###Apply Logistic classifier on Imbalanced data
+
+```{r}
+# Apply Logistic classifier on training set
+normal_classifier = glm(formula = Loan_Status ~ ., family = binomial, data = training_set)
+# Predicting the test set using Under sampling classifier
+normal_probability_predict = predict(normal_classifier, type = 'response', newdata = test_set[-12])
+normal_probability_predict = zoo::na.aggregate(normal_probability_predict)
+y_pred_normal = ifelse(normal_probability_predict>0.5, 1, 0)
+
+# To check the model accuracy using confusionMatrix
+confusionMatrix(table(test_set[, 12], y_pred_normal))
+
+# To check the accuracy of this model using ROC curve.
+roc_over <- PRROC::roc.curve(test_set$Loan_Status, y_pred_normal, curve = TRUE)
+plot(roc_over)
+```
+Error in if (auc < 0.5) { : missing value where TRUE/FALSE needed
+
+#### Logistic Regression Modelling with Balanced Dataset
+
+```{r SmoteFunction}
+## SMOTE Function
+SMOTE <- function(form,data,
+                  perc.over=200,k=5,
+                  perc.under=200,
+                  learner=NULL,...
+)
+  
+  # INPUTS:
+  # form a model formula
+  # data the original training set (with the unbalanced distribution)
+  # minCl  the minority class label
+  # per.over/100 is the number of new cases (smoted cases) generated
+  #              for each rare case. If perc.over < 100 a single case
+  #              is generated uniquely for a randomly selected perc.over
+  #              of the rare cases
+  # k is the number of neighbours to consider as the pool from where
+  #   the new examples are generated
+# perc.under/100 is the number of "normal" cases that are randomly
+#                selected for each smoted case
+# learner the learning system to use.
+# ...  any learning parameters to pass to learner
+{
+  
+  # the column where the target variable is
+  tgt <- which(names(data) == as.character(form[[2]]))
+  minCl <- levels(data[,tgt])[which.min(table(data[,tgt]))]
+  
+  # get the cases of the minority class
+  minExs <- which(data[,tgt] == minCl)
+  
+  # generate synthetic cases from these minExs
+  if (tgt < ncol(data)) {
+    cols <- 1:ncol(data)
+    cols[c(tgt,ncol(data))] <- cols[c(ncol(data),tgt)]
+    data <-  data[,cols]
+  }
+  newExs <- smote.exs(data[minExs,],ncol(data),perc.over,k)
+  if (tgt < ncol(data)) {
+    newExs <- newExs[,cols]
+    data <- data[,cols]
+  }
+  
+  # get the undersample of the "majority class" examples
+  selMaj <- sample((1:NROW(data))[-minExs],
+                   as.integer((perc.under/100)*nrow(newExs)),
+                   replace=T)
+  
+  # the final data set (the undersample+the rare cases+the smoted exs)
+  newdataset <- rbind(data[selMaj,],data[minExs,],newExs)
+  
+  # learn a model if required
+  if (is.null(learner)) return(newdataset)
+  else do.call(learner,list(form,newdataset,...))
+}
+
+
+
+# ===================================================
+# Obtain a set of smoted examples for a set of rare cases.
+# L. Torgo, Feb 2010
+# ---------------------------------------------------
+smote.exs <- function(data,tgt,N,k)
+  # INPUTS:
+  # data are the rare cases (the minority "class" cases)
+  # tgt is the name of the target variable
+  # N is the percentage of over-sampling to carry out;
+  # and k is the number of nearest neighours to use for the generation
+  # OUTPUTS:
+  # The result of the function is a (N/100)*T set of generated
+  # examples with rare values on the target
+{
+  nomatr <- c()
+  T <- matrix(nrow=dim(data)[1],ncol=dim(data)[2]-1)
+  for(col in seq.int(dim(T)[2]))
+    if (class(data[,col]) %in% c('factor','character')) {
+      T[,col] <- as.integer(data[,col])
+      nomatr <- c(nomatr,col)
+    } else T[,col] <- data[,col]
+  
+  if (N < 100) { # only a percentage of the T cases will be SMOTEd
+    nT <- NROW(T)
+    idx <- sample(1:nT,as.integer((N/100)*nT))
+    T <- T[idx,]
+    N <- 100
+  }
+  
+  p <- dim(T)[2]
+  nT <- dim(T)[1]
+  
+  ranges <- apply(T,2,max)-apply(T,2,min)
+  
+  nexs <-  as.integer(N/100) # this is the number of artificial exs generated
+  # for each member of T
+  new <- matrix(nrow=nexs*nT,ncol=p)    # the new cases
+  
+  for(i in 1:nT) {
+    
+    # the k NNs of case T[i,]
+    xd <- scale(T,T[i,],ranges)
+    for(a in nomatr) xd[,a] <- xd[,a]==0
+    dd <- drop(xd^2 %*% rep(1, ncol(xd)))
+    kNNs <- order(dd)[2:(k+1)]
+    
+    for(n in 1:nexs) {
+      # select randomly one of the k NNs
+      neig <- sample(1:k,1)
+      
+      ex <- vector(length=ncol(T))
+      
+      # the attribute values of the generated case
+      difs <- T[kNNs[neig],]-T[i,]
+      new[(i-1)*nexs+n,] <- T[i,]+runif(1)*difs
+      for(a in nomatr)
+        new[(i-1)*nexs+n,a] <- c(T[kNNs[neig],a],T[i,a])[1+round(runif(1),0)]
+      
+    }
+  }
+  newCases <- data.frame(new)
+  for(a in nomatr)
+    newCases[,a] <- factor(newCases[,a],levels=1:nlevels(data[,a]),labels=levels(data[,a]))
+  
+  newCases[,tgt] <- factor(rep(data[1,tgt],nrow(newCases)),levels=levels(data[,tgt]))
+  colnames(newCases) <- colnames(data)
+  newCases
+}
+```
+
+
+```{r}
+library(DMwR2)
+library(ROSE)
+
+## -> For some reason the SMOTE function defined above would not work without the Response Variable as Factor
+training_set$Loan_Status <- as.factor(training_set$Loan_Status)
+
+print('Number of transactions in train dataset before applying sampling methods')
+print(table(training_set$Loan_Status))
+
+# Oversampling, as Fraud transactions(1) are having less occurrence, 
+
+over_sample_train_data <- ovun.sample(Loan_Status ~ ., data = training_set, method="over", N=456)$data
+print('Number of transactions in train dataset after applying Over sampling method')
+print(table(over_sample_train_data$Loan_Status))
+
+# Undersampling,
+#But, you see that weâve lost significant information from the sample. 
+under_sample_train_data <- ovun.sample(Loan_Status ~ ., data = training_set, method="under", N=228)$data
+print('Number of transactions in train dataset after applying Under sampling method')
+print(table(under_sample_train_data$Loan_Status))
+
+# Mixed Sampling, apply both under sampling and over sampling on this imbalanced data
+both_sample_train_data <- ovun.sample(Loan_Status ~ ., data = training_set, method="both", p=0.5, seed=222, N=228)$data
+print('Number of transactions in train dataset after applying Mixed sampling method')
+print(table(both_sample_train_data$Loan_Status))
+
+# ROSE Sampling, this helps us to generate data synthetically. It generates artificial datas instead of dulicate data.
+rose_sample_train_data <- ROSE(Loan_Status ~ ., data = training_set,  seed=111)$data
+print('Number of transactions in train dataset after applying ROSE sampling method')
+print(table(rose_sample_train_data$Loan_Status))
+
+# SMOTE(Synthetic Minority Over-sampling Technique) Sampling
+# formula - relates how our dependent variable acts based on other independent variable.
+# data - input data
+# perc.over - controls the size of Minority class
+# perc.under - controls the size of Majority class
+# since my data has less Majority class, increasing it with 200 and keeping the minority class to 100.
+smote_sample_train_data <- SMOTE(Loan_Status ~ ., data = training_set, perc.over = 100, perc.under=200)
+print('Number of transactions in train dataset after applying SMOTE sampling method')
+print(table(smote_sample_train_data$Loan_Status))
+```
+
+```{r}
+##Apply Logistic classifier on balanced data
+
+# Now we have five different types of inputs which are balanced and ready for prediction.
+# We can appply Logistic classifier to all these five datasets and calculate the performance of each.
+
+# Logistic classifier for Over sampling dataset
+over_classifier = glm(formula = Loan_Status ~ ., family = binomial, data = over_sample_train_data)
+
+# Logistic classifier for Under sampling dataset
+under_classifier = glm(formula = Loan_Status ~ ., family = binomial, data = under_sample_train_data)
+
+# Logistic classifier for Mixed sampling dataset
+both_classifier = glm(formula = Loan_Status ~ ., family = binomial, data = both_sample_train_data)
+
+#Logistic classifier for ROSE sampling dataset
+rose_classifier = glm(formula = Loan_Status ~ ., family = binomial, data = rose_sample_train_data)
+
+# Logistic classifier for SMOTE dataset
+smote_classifier = glm(formula = Loan_Status ~ ., family = binomial, data = smote_sample_train_data)
+```
+
+```{r}
+# Predicting the test set using Over sampling classifier
+over_probability_predict = predict(over_classifier, type = 'response', newdata = test_set[-12])
+y_pred_over = ifelse(over_probability_predict>0.5, 1, 0)
+
+# Predicting the test set using Under sampling classifier
+under_probability_predict = predict(under_classifier, type = 'response', newdata = test_set[-12])
+y_pred_under = ifelse(under_probability_predict>0.5, 1, 0)
+
+# Predicting the test set using Mixed sampling classifier
+both_probability_predict = predict(both_classifier, type = 'response', newdata = test_set[-12])
+y_pred_both = ifelse(both_probability_predict>0.5, 1, 0)
+
+# Predicting the test set using ROSE classifier
+rose_probability_predict = predict(rose_classifier, type = 'response', newdata = test_set[-12])
+y_pred_rose = ifelse(rose_probability_predict>0.5, 1, 0)
+
+# Predicting the test set using SMOTE classifier
+smote_probability_predict = predict(smote_classifier, type = 'response', newdata = test_set[-12])
+y_pred_smote = ifelse(smote_probability_predict>0.5, 1, 0)
+```
+
+
+## Evaluating Model (with ROC Curve)
+
+
+```{r}
+library(patchwork)
+library(cowplot)
+
+test_set$Loan_Status <- as.factor(test_set$Loan_Status)
+# For reson(s) this keeps generating NA* values
+# y_pred_both = zoo::na.aggregate(y_pred_both) 
+# y_pred_normal = zoo::na.aggregate(y_pred_normal) 
+# y_pred_over = zoo::na.aggregate(y_pred_over) 
+# y_pred_rose = zoo::na.aggregate(y_pred_rose) 
+# y_pred_smote = zoo::na.aggregate(y_pred_smote) 
+# y_pred_under = zoo::na.aggregate(y_pred_under) 
+
+pred_list <- c("y_pred_both", "y_pred_normal", "y_pred_over", "y_pred_rose", "y_pred_smote", "y_pred_under")
+
+for(pred in pred_list) assign(pred, zoo::na.aggregate(get(pred)))
+
+layout(matrix(c(1,1,2,3), 2, 2, byrow = TRUE))
+# ROC curve of over sampling data
+roc_over <- PRROC::roc.curve(test_set$Loan_Status, y_pred_over, curve = T)
+ 
+plot(roc_over,
+main="ROC Curve: Original Distribution")
+
+# ROC curve of Under sampling data
+roc_under <- PRROC::roc.curve(test_set$Loan_Status, y_pred_under, curve = T)
+
+plot(roc_under,
+main="ROC Curve: UnderSampled Distribution")
+
+# ROC curve of both sampling data
+roc_both <- PRROC::roc.curve(test_set$Loan_Status, y_pred_both, curve = T)
+plot(roc_both,
+main="ROC Curve: Mixed-Sampled Distribution")
+
+# ROC curve of Random Over Sampling Examples [ROSE]sampling data
+roc_rose <- PRROC::roc.curve(test_set$Loan_Status, y_pred_rose, curve = T)
+roc_rose_p <- plot(roc_rose,
+main="ROC Curve: ROSE Distribution")
+
+# ROC curve of Synthetic Minority Over-Sampling Technique [SMOTE] sampling data
+roc_smote <- PRROC::roc.curve(test_set$Loan_Status, y_pred_smote, curve = T)
+roc_smote_p <- plot(roc_smote,
+main="ROC Curve: SMOTEDistribution")
+ 
+# roc_under_p + roc_over_p + roc_both_p + roc_rose_p + roc_smote_p + plot_layout(ncol = 1, heights = c(1, 5))
+```
+
+```{r}
+library(pROC)
+
+roc_under <- roc(test_set$Loan_Status, y_pred_under)
+ggroc(roc_under)
+
+# figurw
+```
+

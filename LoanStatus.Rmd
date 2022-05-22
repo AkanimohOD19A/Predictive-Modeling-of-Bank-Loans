@@ -1,0 +1,154 @@
+---
+title: "Loan Status Prediction"
+output: html_notebook
+---
+
+## Load Libraries
+
+```{r message=F, echo=F}
+library(tidyverse)
+library(DT)
+library(data.table)
+```
+
+## Data Inspection and Cleaning
+
+```{r}
+loan_Df <- read.csv("C:/Users/PC/Documents/R_4DS/bank_loan.csv", na.strings = c("", " ", NA))
+
+glimpse(loan_Df)
+```
+
+Glimpse of dataset indicates an approach to Supervised Learning, a couple of explanatory variablesinfluencing whether or not a Loan is availed, a binarized outcome implying a Logistic Regression approach to understanding these underlying/obvious variable relationship.
+
+```{r}
+## Check Missing Values
+null_vars <- (sapply(loan_Df, function(x) sum(is.na(x))))
+t(data.frame(null_vars))
+```
+
+- Having a *Missing* credit history is as good as having None, will change NAs here to 0
+- Will not hurt to make the missing Loan Amount the mean of all known requested Loan
+- ..
+
+
+```{r}
+## Blank Rows
+blank_rows <- (sapply(loan_Df, function(x) sum(x == "")))
+t(data.frame(blank_rows))
+```
+
+
+```{r}
+loan_Df <- loan_Df %>% 
+  mutate(Credit_History = replace_na(Credit_History, mean(Credit_History, na.rm = T))) %>% 
+  mutate(LoanAmount = replace_na(LoanAmount, mean(LoanAmount, na.rm = T))) %>% 
+  mutate(Dependents = replace_na(Dependents, mean(Dependents, na.rm = T))) %>% 
+  mutate(Loan_Amount_Term = replace_na(Loan_Amount_Term, min(Dependents, na.rm = T))) %>% 
+  fill(Gender, .direction =  'downup') %>% 
+  fill(Self_Employed, .direction =  'updown') %>% 
+  filter(!Married == "") %>% 
+  mutate(Credit_History = ifelse(Credit_History < 1, 0, Credit_History)) %>% 
+  mutate(Loan_Amount_Term = case_when(Loan_Amount_Term <= 120 ~ "Short_Termed",
+                                    Loan_Amount_Term <= 300 ~ "Mid_Termed",
+                                    Loan_Amount_Term > 300 ~ "Long_Termed")) %>%  
+  mutate(Loan_Amount_Term = factor(Loan_Amount_Term, levels = c("Short_Termed", "Mid_Termed", "Long_Termed"))) %>% 
+  select(-c(Loan_ID))
+```
+
+
+## Exploratory Data Analysis
+
+```{r}
+## Distrubtution of the Response Variable
+loan_Df %>% 
+  ggplot(aes(x = Loan_Status))+
+  geom_bar()
+```
+
+Over response data is imbalanced.
+
+## Modelling
+
+#### Preprocessing Data
+```{r}
+library(mltools)
+ml_df <- data.table(loan_Df[-12])
+
+ml_df_encoded <- one_hot(ml_df)
+ml_df_encoded <- cbind(ml_df_encoded, loan_Df[12])
+quick_sample(ml_df_encoded)
+```
+
+```{r}
+### Train-Test
+n_train <- round(0.8*nrow(ml_df_encoded))
+train_indices <- sample(1:nrow(ml_df_encoded), n_train)
+df_train <- ml_df_encoded[train_indices,]
+df_test <- ml_df_encoded[-train_indices,]
+```
+
+```{r}
+### Logistic
+logi_model <- glm(formula = Loan_Status ~ Gender_Female + Gender_Male + 
+                   Married_Yes + Dependents + Education_Graduate + 
+                   Self_Employed_No + ApplicantIncome + CoapplicantIncome + 
+                   LoanAmount + Loan_Amount_Term_Short_Termed + 
+                   Loan_Amount_Term_Mid_Termed + Loan_Amount_Term_Long_Termed + 
+                   Credit_History + Property_Area_Rural + 
+                   Property_Area_Semiurban + Property_Area_Urban, family = "binomial", data = df_train)
+
+#disable scientific notation for model summary
+options(scipen=999)
+
+#view model summary
+summary(logi_model)
+```
+
+
+## Evaluation
+```{r}
+library(pscl)
+
+pR2(logi_model)["McFadden"]
+```
+
+A value of **0.1838804** is low for McFadden’s R2, which indicates that our model does not fit the data very well and has low predictive
+power.
+
+```{r}
+## VIP Variables
+library(caret)
+
+vip_vars <- data.frame(varImp(logi_model))
+vip_vars %>% 
+  arrange(-Overall)
+```
+
+```{r}
+library(InformationValue)
+## Make Predictions
+predicted <- predict(logi_model, df_test, type="response")
+
+optimal <- optimalCutoff(df_test$Loan_Status, predicted)[1]
+optimal
+```
+#+> prediction from a rank-deficient fit may be misleading
+This tells us that the optimal probability cutoff to use is **0.1185697**. Thus, any individual with a probability of defaulting of **0.1185697** or higher will be predicted to get the Loan, while any individual with a probability less than this number will be predicted to not be availed a Loan.
+
+```{r}
+## Checking
+confusionMatrix(df_test$Loan_Status, predicted)
+```
+
+```{r}
+#calculate sensitivity
+sensitivity(df_test$Loan_Status, predicted)
+
+#calculate specificity
+specificity(df_test$Loan_Status, predicted)
+
+#calculate total misclassification error rate
+misClassError(df_test$Loan_Status, predicted, threshold=optimal)
+```
+
